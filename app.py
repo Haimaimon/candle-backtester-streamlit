@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import io
+import logging
+import time
 from typing import List
 
 import streamlit as st
@@ -14,6 +16,25 @@ from candle_backtester import (
     PatternBacktester,
     load_ohlc,
 )
+
+# הגדרת logging - מונע דפליקציה
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    force=True  # אם יש הגדרות קודמות, נתקע אותן
+)
+logger = logging.getLogger(__name__)
+logger.propagate = False  # מונע העברה ל-root logger (מונע דפליקציה)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 st.set_page_config(
     page_title="Candle Pattern Backtester",
@@ -66,6 +87,32 @@ max_bars = st.sidebar.slider(
 )
 
 st.sidebar.write("---")
+st.sidebar.subheader("🎯 Pattern Validator (12 Filters)")
+
+use_validator = st.sidebar.checkbox(
+    "השתמש ב-Pattern Validator (12 פילטרים)", value=True
+)
+
+min_pattern_score = 0.0
+require_entry_trigger = True
+require_volume_confirmation = True
+max_bars_before_pattern = 20
+
+if use_validator:
+    min_pattern_score = st.sidebar.slider(
+        "ציון מינימלי לדפוס (0-100)", min_value=0.0, max_value=100.0, step=5.0, value=40.0
+    )
+    require_entry_trigger = st.sidebar.checkbox(
+        "דרוש Entry Trigger", value=True
+    )
+    require_volume_confirmation = st.sidebar.checkbox(
+        "דרוש Volume Confirmation", value=True
+    )
+    max_bars_before_pattern = st.sidebar.slider(
+        "Max bars before pattern", min_value=5, max_value=50, step=5, value=20
+    )
+
+st.sidebar.write("---")
 run_button = st.sidebar.button("🚀 Run Backtest")
 
 
@@ -76,11 +123,26 @@ if run_button:
     if not tickers:
         st.error("לא הוזנו טיקרים.")
     else:
+        logger.info("=" * 60)
+        logger.info("Starting backtest session")
+        logger.info(f"Tickers: {tickers}")
+        logger.info(f"Interval: {interval}, Period: {period}")
+        logger.info(f"Patterns: {patterns_selected if patterns_selected else 'All'}")
+        logger.info(f"Validator: {use_validator}, Min Score: {min_pattern_score}")
+        logger.info("=" * 60)
+        
+        overall_start_time = time.time()
+        
         backtester = PatternBacktester(
             rr=rr,
             max_bars_in_trade=max_bars,
             use_trend_filter=True,
             ma_window=50,
+            use_pattern_validator=use_validator,
+            min_pattern_score=min_pattern_score,
+            require_entry_trigger=require_entry_trigger,
+            require_volume_confirmation=require_volume_confirmation,
+            max_bars_before_pattern=max_bars_before_pattern,
         )
 
         all_stats: List[BacktestStats] = []
@@ -94,24 +156,47 @@ if run_button:
         curr_step = 0
 
         for symbol in tickers:
+            symbol_start_time = time.time()
+            logger.info(f"\n--- Processing {symbol} ---")
             st.write(f"### {symbol} – interval={interval}, period={period}")
             try:
+                logger.info(f"Loading data for {symbol}...")
+                load_start = time.time()
                 df = load_ohlc(symbol, interval=interval, period=period)
+                load_time = time.time() - load_start
+                logger.info(f"Data loaded: {len(df)} candles in {load_time:.2f} seconds")
             except Exception as e:
-                st.error(f"לא ניתן לטעון נתונים עבור {symbol}: {e}")
+                error_msg = f"לא ניתן לטעון נתונים עבור {symbol}: {e}"
+                logger.error(error_msg, exc_info=True)
+                st.error(error_msg)
                 continue
 
             this_patterns = patterns_selected if patterns_selected else all_patterns
+            logger.info(f"Testing {len(this_patterns)} patterns for {symbol}")
 
             for pattern in this_patterns:
-                stats = backtester.backtest_symbol_pattern(symbol, df, pattern)
-                all_stats.append(stats)
+                pattern_start = time.time()
+                logger.info(f"Testing pattern: {pattern}")
+                
+                try:
+                    stats = backtester.backtest_symbol_pattern(symbol, df, pattern)
+                    pattern_time = time.time() - pattern_start
+                    all_stats.append(stats)
 
-                st.write(
-                    f"- **{pattern}**: trades={stats.num_trades}, "
-                    f"win_rate={stats.win_rate*100:.1f}%, "
-                    f"avg_R={stats.avg_r:.2f}, total_R={stats.total_r:.2f}"
-                )
+                    logger.info(f"Pattern {pattern} completed in {pattern_time:.2f}s: "
+                              f"trades={stats.num_trades}, win_rate={stats.win_rate*100:.1f}%, "
+                              f"avg_R={stats.avg_r:.2f}, total_R={stats.total_r:.2f}")
+
+                    st.write(
+                        f"- **{pattern}**: trades={stats.num_trades}, "
+                        f"win_rate={stats.win_rate*100:.1f}%, "
+                        f"avg_R={stats.avg_r:.2f}, total_R={stats.total_r:.2f}"
+                    )
+                except Exception as e:
+                    error_msg = f"Error testing pattern {pattern} for {symbol}: {e}"
+                    logger.error(error_msg, exc_info=True)
+                    st.error(error_msg)
+                    continue
 
                 # נבנה גם את רשימת העסקאות הגולמית
                 for t in stats.trades:
@@ -128,6 +213,13 @@ if run_button:
                             "exit_price": t.exit_price,
                             "r_multiple": t.r_multiple,
                             "bars_in_trade": t.bars_in_trade,
+                            "volume_before": t.volume_before,
+                            "volume_after": t.volume_after,
+                            "is_trending": t.is_trending,
+                            "is_support_zone": t.is_support_zone,
+                            "rsi_divergence": t.rsi_divergence,
+                            "candle_range_strength": t.candle_range_strength,
+                            "pattern_strength_score": t.pattern_strength_score,
                         }
                     )
 
@@ -136,15 +228,32 @@ if run_button:
                     min(curr_step / total_steps, 1.0),
                     text=f"מריץ בק-טסט... ({curr_step}/{total_steps})",
                 )
+            
+            symbol_time = time.time() - symbol_start_time
+            logger.info(f"{symbol} completed in {symbol_time:.2f} seconds")
 
+        overall_time = time.time() - overall_start_time
+        total_trades = sum(stats.num_trades for stats in all_stats)
+        
+        logger.info("=" * 60)
+        logger.info("Backtest session complete")
+        logger.info(f"Total symbols processed: {len(tickers)}")
+        logger.info(f"Total patterns tested: {len(all_stats)}")
+        logger.info(f"Total trades: {total_trades}")
+        logger.info(f"Total elapsed time: {overall_time:.2f} seconds")
+        logger.info("=" * 60)
+        
         if not all_stats:
             st.warning("לא נמצאו עסקאות.")
+            logger.warning("No trades found in backtest")
             # ננקה את ה-session_state כדי לא להציג נתונים ישנים
             st.session_state["trades_df"] = None
             st.session_state["summary_df"] = None
         else:
+            logger.info("Creating summary and trades dataframe...")
             summary_df = summarize_stats(all_stats)
             trades_df = pd.DataFrame(trades_rows) if trades_rows else pd.DataFrame()
+            logger.info(f"Summary created: {len(summary_df)} rows, Trades: {len(trades_df)} rows")
 
             # ננקה timezone כדי להימנע מבעיות ב-Excel ובווידג'טים
             if not trades_df.empty:
@@ -214,7 +323,215 @@ else:
         if trades_df.empty:
             st.info("אין עסקאות לניתוח.")
         else:
+            # בדיקה אם יש שדות חדשים
+            has_pattern_score = "pattern_strength_score" in trades_df.columns
+            
+            if has_pattern_score:
+                # ========= Heatmap לפי Pattern Strength Score =========
+                st.subheader("🔥 Heatmap של הצלחה לפי Pattern Strength Score")
+                
+                # יצירת bins לציון
+                score_bins = [0, 30, 50, 70, 85, 100]
+                trades_df_temp = trades_df.copy()
+                trades_df_temp["score_bin"] = pd.cut(
+                    trades_df_temp["pattern_strength_score"],
+                    bins=score_bins,
+                    labels=["0-30", "30-50", "50-70", "70-85", "85-100"],
+                    include_lowest=True
+                )
+                
+                # חישוב win rate לפי דפוס וציון
+                heatmap_data = []
+                for pattern in trades_df_temp["pattern"].unique():
+                    for score_bin in trades_df_temp["score_bin"].cat.categories:
+                        subset = trades_df_temp[
+                            (trades_df_temp["pattern"] == pattern) &
+                            (trades_df_temp["score_bin"] == score_bin)
+                        ]
+                        if len(subset) > 0:
+                            win_rate = (subset["r_multiple"] > 0).sum() / len(subset) * 100
+                            avg_r = subset["r_multiple"].mean()
+                            num_trades = len(subset)
+                            heatmap_data.append({
+                                "pattern": pattern,
+                                "score_range": str(score_bin),
+                                "win_rate": win_rate,
+                                "avg_r": avg_r,
+                                "num_trades": num_trades,
+                            })
+                
+                if heatmap_data:
+                    heatmap_df = pd.DataFrame(heatmap_data)
+                    
+                    # יצירת pivot table ל-heatmap
+                    pivot_winrate = heatmap_df.pivot(
+                        index="pattern",
+                        columns="score_range",
+                        values="win_rate"
+                    ).fillna(0)
+                    
+                    pivot_avg_r = heatmap_df.pivot(
+                        index="pattern",
+                        columns="score_range",
+                        values="avg_r"
+                    ).fillna(0)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("**Win Rate (%) לפי Pattern ו-Score**")
+                        try:
+                            # ניסיון להציג עם background gradient (דורש matplotlib)
+                            styled_df = pivot_winrate.style.background_gradient(cmap="RdYlGn", vmin=0, vmax=100)
+                            st.dataframe(styled_df, use_container_width=True)
+                        except ImportError:
+                            # אם matplotlib לא מותקן, הצג ללא styling
+                            st.dataframe(pivot_winrate, use_container_width=True)
+                    
+                    with col2:
+                        st.markdown("**Average R לפי Pattern ו-Score**")
+                        try:
+                            # ניסיון להציג עם background gradient (דורש matplotlib)
+                            styled_df = pivot_avg_r.style.background_gradient(cmap="RdYlGn", vmin=-1, vmax=2)
+                            st.dataframe(styled_df, use_container_width=True)
+                        except ImportError:
+                            # אם matplotlib לא מותקן, הצג ללא styling
+                            st.dataframe(pivot_avg_r, use_container_width=True)
+                    
+                    # גרף הצלחה לפי ציון
+                    st.markdown("### Win Rate לפי Pattern Strength Score")
+                    score_summary = trades_df_temp.groupby("score_bin").agg({
+                        "r_multiple": lambda x: (x > 0).sum() / len(x) * 100,
+                        "pattern_strength_score": "count"
+                    }).rename(columns={"r_multiple": "win_rate", "pattern_strength_score": "num_trades"})
+                    st.bar_chart(score_summary["win_rate"])
+                
+                # ========= Optimal Conditions Finder =========
+                st.subheader("🎯 Optimal Conditions Finder")
+                st.markdown("**מציאת התנאים האופטימליים שהביאו הכי הרבה רווח**")
+                
+                # ניתוח לפי תנאים שונים
+                conditions_analysis = []
+                
+                # ניתוח לפי Support Zone
+                if "is_support_zone" in trades_df.columns:
+                    for support in [True, False]:
+                        subset = trades_df[trades_df["is_support_zone"] == support]
+                        if len(subset) > 0:
+                            win_rate = (subset["r_multiple"] > 0).sum() / len(subset) * 100
+                            avg_r = subset["r_multiple"].mean()
+                            conditions_analysis.append({
+                                "condition": f"Support Zone: {support}",
+                                "num_trades": len(subset),
+                                "win_rate": win_rate,
+                                "avg_r": avg_r,
+                                "total_r": subset["r_multiple"].sum(),
+                            })
+                
+                # ניתוח לפי RSI Divergence
+                if "rsi_divergence" in trades_df.columns:
+                    for rsi_div in [True, False]:
+                        subset = trades_df[trades_df["rsi_divergence"] == rsi_div]
+                        if len(subset) > 0:
+                            win_rate = (subset["r_multiple"] > 0).sum() / len(subset) * 100
+                            avg_r = subset["r_multiple"].mean()
+                            conditions_analysis.append({
+                                "condition": f"RSI Divergence: {rsi_div}",
+                                "num_trades": len(subset),
+                                "win_rate": win_rate,
+                                "avg_r": avg_r,
+                                "total_r": subset["r_multiple"].sum(),
+                            })
+                
+                # ניתוח לפי Trend
+                if "is_trending" in trades_df.columns:
+                    for trending in [True, False]:
+                        subset = trades_df[trades_df["is_trending"] == trending]
+                        if len(subset) > 0:
+                            win_rate = (subset["r_multiple"] > 0).sum() / len(subset) * 100
+                            avg_r = subset["r_multiple"].mean()
+                            conditions_analysis.append({
+                                "condition": f"Trending: {trending}",
+                                "num_trades": len(subset),
+                                "win_rate": win_rate,
+                                "avg_r": avg_r,
+                                "total_r": subset["r_multiple"].sum(),
+                            })
+                
+                # ניתוח לפי ציון גבוה (>= 70)
+                if has_pattern_score:
+                    for min_score in [70, 85]:
+                        subset = trades_df[trades_df["pattern_strength_score"] >= min_score]
+                        if len(subset) > 0:
+                            win_rate = (subset["r_multiple"] > 0).sum() / len(subset) * 100
+                            avg_r = subset["r_multiple"].mean()
+                            conditions_analysis.append({
+                                "condition": f"Pattern Score >= {min_score}",
+                                "num_trades": len(subset),
+                                "win_rate": win_rate,
+                                "avg_r": avg_r,
+                                "total_r": subset["r_multiple"].sum(),
+                            })
+                
+                if conditions_analysis:
+                    conditions_df = pd.DataFrame(conditions_analysis)
+                    conditions_df = conditions_df.sort_values("avg_r", ascending=False)
+                    st.dataframe(conditions_df, use_container_width=True)
+                    
+                    # הצגת התנאים הטובים ביותר
+                    st.markdown("### 🏆 התנאים הטובים ביותר")
+                    top_conditions = conditions_df.head(5)
+                    for idx, row in top_conditions.iterrows():
+                        st.markdown(
+                            f"- **{row['condition']}**: "
+                            f"Win Rate={row['win_rate']:.1f}%, "
+                            f"Avg R={row['avg_r']:.2f}, "
+                            f"Total R={row['total_r']:.2f}, "
+                            f"Trades={int(row['num_trades'])}"
+                        )
+                
+                # ========= סינון לפי ציון מינימלי =========
+                st.markdown("---")
+                st.subheader("📊 סקירת טריידים רק בציון גבוה")
+                
+                min_score_filter = st.slider(
+                    "ציון מינימלי להצגה",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=5.0,
+                    value=70.0 if has_pattern_score else 0.0,
+                )
+                
+                high_score_trades = trades_df[
+                    trades_df["pattern_strength_score"] >= min_score_filter
+                ] if has_pattern_score else trades_df
+                
+                if not high_score_trades.empty:
+                    st.markdown(f"**נמצאו {len(high_score_trades)} עסקאות עם ציון >= {min_score_filter}**")
+                    
+                    num_trades_high = len(high_score_trades)
+                    wins_high = (high_score_trades["r_multiple"] > 0).sum()
+                    win_rate_high = wins_high / num_trades_high * 100.0
+                    avg_R_high = high_score_trades["r_multiple"].mean()
+                    total_R_high = high_score_trades["r_multiple"].sum()
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("מספר עסקאות", num_trades_high)
+                    col2.metric("אחוז הצלחה", f"{win_rate_high:.1f}%")
+                    col3.metric("R ממוצע", f"{avg_R_high:.2f}")
+                    col4.metric("R כולל", f"{total_R_high:.2f}")
+                    
+                    st.dataframe(
+                        high_score_trades.sort_values("pattern_strength_score", ascending=False),
+                        use_container_width=True,
+                        height=400,
+                    )
+                else:
+                    st.warning(f"לא נמצאו עסקאות עם ציון >= {min_score_filter}")
+            
+            # ========= המשך עם הפילטרים הקיימים =========
             # פילטרים: תאריך, דפוס, bars_in_trade
+            st.markdown("---")
             min_date = trades_df["entry_time"].min().date()
             max_date = trades_df["entry_time"].max().date()
 

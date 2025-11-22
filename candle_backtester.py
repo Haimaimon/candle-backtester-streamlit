@@ -10,12 +10,29 @@ Candle Pattern Backtester v2
 """
 
 import argparse
-from dataclasses import dataclass
+import logging
+import time
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from pattern_validator import PatternValidator, PatternValidationResult
+
+# הגדרת logger - מונע דפליקציה
+logger = logging.getLogger(__name__)
+logger.propagate = False  # מונע העברה ל-root logger (מונע דפליקציה)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 # ========= Domain Models =========
@@ -33,6 +50,14 @@ class TradeResult:
     exit_price: float
     r_multiple: float
     bars_in_trade: int
+    # New fields for enhanced analysis
+    volume_before: float = 0.0
+    volume_after: float = 0.0
+    is_trending: bool = False
+    is_support_zone: bool = False
+    rsi_divergence: bool = False
+    candle_range_strength: float = 0.0
+    pattern_strength_score: float = 0.0
 
 
 @dataclass
@@ -213,12 +238,41 @@ PATTERN_FUNCS: Dict[str, callable] = {
 # ========= Backtester =========
 
 class PatternBacktester:
-    def __init__(self, rr: float = 2.0, max_bars_in_trade: int = 10,
-                 use_trend_filter: bool = True, ma_window: int = 50):
+    def __init__(
+        self,
+        rr: float = 2.0,
+        max_bars_in_trade: int = 10,
+        use_trend_filter: bool = True,
+        ma_window: int = 50,
+        use_pattern_validator: bool = True,
+        min_pattern_score: float = 0.0,  # ציון מינימלי (0-100)
+        require_entry_trigger: bool = True,
+        require_volume_confirmation: bool = True,
+        max_bars_before_pattern: int = 20,
+    ):
         self.rr = rr
         self.max_bars_in_trade = max_bars_in_trade
         self.use_trend_filter = use_trend_filter
         self.ma_window = ma_window
+        self.use_pattern_validator = use_pattern_validator
+        self.min_pattern_score = min_pattern_score
+        self.require_entry_trigger = require_entry_trigger
+        self.require_volume_confirmation = require_volume_confirmation
+        self.max_bars_before_pattern = max_bars_before_pattern
+        
+        # יצירת Pattern Validator
+        if self.use_pattern_validator:
+            self.validator = PatternValidator(
+                ma_window=ma_window,
+                max_bars_before_pattern=max_bars_before_pattern,
+                enable_logging=True,
+            )
+            logger.info(f"Pattern Validator initialized: min_score={min_pattern_score}, "
+                       f"require_entry_trigger={require_entry_trigger}, "
+                       f"require_volume_confirmation={require_volume_confirmation}")
+        else:
+            self.validator = None
+            logger.info("Pattern Validator disabled")
 
     def _trend_filter_long(self, df: pd.DataFrame) -> pd.Series:
         close = df["Close"]
@@ -228,34 +282,157 @@ class PatternBacktester:
     def backtest_symbol_pattern(
         self, symbol: str, df: pd.DataFrame, pattern_name: str
     ) -> BacktestStats:
+        start_time = time.time()
+        logger.info(f"Starting backtest: {symbol}, pattern={pattern_name}, candles={len(df)}")
+        
         pattern_func = PATTERN_FUNCS[pattern_name]
         signals = pattern_func(df)
+        
+        num_signals = signals.sum()
+        logger.info(f"Found {num_signals} {pattern_name} signals in {len(df)} candles")
 
-        if self.use_trend_filter:
+        if self.use_trend_filter and not self.use_pattern_validator:
+            # אם משתמשים ב-validator, הוא כבר בודק מגמה
             trend_ok = self._trend_filter_long(df)
             signals = signals & trend_ok
+            num_signals_after_trend = signals.sum()
+            logger.info(f"After trend filter: {num_signals_after_trend} signals remain")
+
+        # ========= אופטימיזציה: חישוב אינדיקטורים פעם אחת =========
+        precomputed_indicators = None
+        precomputed_support = None
+        
+        if self.use_pattern_validator and self.validator:
+            logger.info("Precomputing indicators and support zones for optimization...")
+            precomputed_indicators = self.validator.calculate_indicators(df, use_cache=True)
+            precomputed_support = self.validator.find_support_zones(precomputed_indicators, use_cache=True)
+            logger.info("Precomputation complete - ready for validation")
 
         trades: List[TradeResult] = []
         in_trade = False
         entry = stop = target = 0.0
         entry_time: Optional[pd.Timestamp] = None
+        pattern_idx: Optional[int] = None  # אינדקס של הדפוס
         bars_in_trade = 0
+        stored_validation_result: Optional[PatternValidationResult] = None
+        
+        validation_checks = 0
+        validation_passed = 0
+        validation_failed_score = 0
+        validation_failed_filters = 0
+        
+        # סטטיסטיקות מפורטות על פילטרים נכשלים
+        filter_failures: Dict[str, int] = {}
 
         for i in range(len(df) - 1):
             if not in_trade and bool(signals.iloc[i]):
-                next_idx = df.index[i + 1]
-                entry = float(df["Open"].iloc[i + 1])
-
+                # ========= Pattern Validation =========
+                validation_result: Optional[PatternValidationResult] = None
+                
+                if self.use_pattern_validator and self.validator:
+                    validation_checks += 1
+                    
+                    # שימוש ב-precomputed indicators לתאוצה
+                    # אם יש precomputed, נשתמש בו; אחרת נשתמש ב-df המקורי
+                    validation_df = precomputed_indicators if precomputed_indicators is not None else df
+                    validation_result = self.validator.validate_pattern(
+                        validation_df,
+                        i,
+                        pattern_name,
+                        use_all_filters=True,
+                        precomputed_indicators=precomputed_indicators,
+                        precomputed_support=precomputed_support,
+                    )
+                    
+                    # בדיקת ציון מינימלי
+                    if validation_result.pattern_score < self.min_pattern_score:
+                        validation_failed_score += 1
+                        logger.debug(f"Pattern at {i} failed: score {validation_result.pattern_score:.1f} < {self.min_pattern_score}")
+                        continue
+                    
+                    # בדיקת כל הפילטרים (חוץ מ-Entry Trigger שנבדוק מיד)
+                    # נבדוק Entry Trigger בנפרד
+                    # חלוקה לפילטרים קריטיים ואופציונליים
+                    critical_filters = {
+                        'trend_filter': validation_result.validation_details.get('trend_filter', True),
+                        'volume_confirmation': validation_result.validation_details.get('volume_confirmation', True),
+                        'not_narrow': validation_result.validation_details.get('not_narrow', True),
+                        'stop_size_ok': validation_result.validation_details.get('stop_size_ok', True),
+                    }
+                    
+                    optional_filters = {
+                        'support_zone': validation_result.validation_details.get('support_zone', True),
+                        'trading_hours': validation_result.validation_details.get('trading_hours', True),
+                        'max_bars_ok': validation_result.validation_details.get('max_bars_ok', True),
+                        'is_at_bottom': validation_result.validation_details.get('is_at_bottom', True),
+                    }
+                    
+                    # בדיקת Volume Confirmation (אם נדרש) - אבל נכלול אותו בסטטיסטיקות
+                    if self.require_volume_confirmation and not critical_filters['volume_confirmation']:
+                        validation_failed_filters += 1
+                        filter_failures['volume_confirmation'] = filter_failures.get('volume_confirmation', 0) + 1
+                        if validation_failed_filters <= 5:  # רק 5 הראשונים
+                            logger.debug(f"Pattern {pattern_name} at {i} failed: no volume confirmation")
+                        continue
+                    
+                    # כל הפילטרים הקריטיים חייבים לעבור + לפחות פילטר אופציונלי אחד
+                    critical_ok = all(critical_filters.values())
+                    optional_passed = sum(optional_filters.values())
+                    other_filters_ok = critical_ok and (optional_passed >= 1)
+                    
+                    if not other_filters_ok:
+                        validation_failed_filters += 1
+                        # רישום פילטרים שנכשלו לסטטיסטיקה
+                        all_filters = {**critical_filters, **optional_filters}
+                        failed_filters = [name for name, passed in all_filters.items() if not passed]
+                        for filter_name in failed_filters:
+                            filter_failures[filter_name] = filter_failures.get(filter_name, 0) + 1
+                        
+                        # לוג מפורט רק במקרים מעטים (לא להציף)
+                        if validation_failed_filters <= 5:  # רק 5 הראשונים
+                            logger.debug(
+                                f"Pattern {pattern_name} at {i} failed filters: {', '.join(failed_filters[:3])} | "
+                                f"Score={validation_result.pattern_score:.1f}, "
+                                f"Trend={validation_result.is_trending}, "
+                                f"Support={validation_result.is_support_zone}, "
+                                f"Volume={validation_result.validation_details.get('volume_confirmation', False)}, "
+                                f"Critical OK: {critical_ok}, Optional passed: {optional_passed}/4"
+                            )
+                        continue
+                    
+                    validation_passed += 1
+                
+                # ========= Entry Logic with Trigger =========
+                # Filter 4: Entry Trigger - נכנסים רק אם הנר הבא עובר את ה-High של הדפוס
+                if i < len(df) - 1:
+                    pattern_high = float(df["High"].iloc[i])
+                    next_high = float(df["High"].iloc[i + 1])
+                    
+                    # אם נדרש Entry Trigger, נבדוק אותו
+                    entry_trigger_ok = True
+                    if self.use_pattern_validator and self.require_entry_trigger:
+                        entry_trigger_ok = next_high > pattern_high
+                        if not entry_trigger_ok:
+                            continue  # אין טריגר, לא נכנס
+                    
+                    # הכניסה היא ב-Open של הנר הבא
+                    entry = float(df["Open"].iloc[i + 1])
+                else:
+                    continue  # אין נר הבא, לא נכנס
+                
                 pattern_low = float(df["Low"].iloc[i])
                 stop = pattern_low
+                
                 if entry <= stop:
                     continue
 
                 risk_per_share = entry - stop
                 target = entry + self.rr * risk_per_share
 
-                entry_time = next_idx
+                entry_time = df.index[i + 1] if i < len(df) - 1 else df.index[i]
+                pattern_idx = i  # שמירת אינדקס הדפוס
                 bars_in_trade = 0
+                stored_validation_result = validation_result  # שמירת תוצאות ה-Validation
                 in_trade = True
                 continue
 
@@ -277,22 +454,91 @@ class PatternBacktester:
 
                 if exit_price is not None and entry_time is not None:
                     r_multiple = (exit_price - entry) / (entry - stop)
-                    trades.append(
-                        TradeResult(
-                            symbol=symbol,
-                            pattern=pattern_name,
-                            entry_time=entry_time,
-                            exit_time=cur_time,
-                            direction="LONG",
-                            entry=entry,
-                            stop=stop,
-                            target=target,
-                            exit_price=exit_price,
-                            r_multiple=r_multiple,
-                            bars_in_trade=bars_in_trade,
-                        )
+                    
+                    # יצירת TradeResult עם כל השדות החדשים
+                    trade_result = TradeResult(
+                        symbol=symbol,
+                        pattern=pattern_name,
+                        entry_time=entry_time,
+                        exit_time=cur_time,
+                        direction="LONG",
+                        entry=entry,
+                        stop=stop,
+                        target=target,
+                        exit_price=exit_price,
+                        r_multiple=r_multiple,
+                        bars_in_trade=bars_in_trade,
                     )
+                    
+                    # הוספת שדות מה-Validation Result
+                    if stored_validation_result:
+                        trade_result.volume_before = stored_validation_result.volume_before
+                        trade_result.volume_after = stored_validation_result.volume_after
+                        trade_result.is_trending = stored_validation_result.is_trending
+                        trade_result.is_support_zone = stored_validation_result.is_support_zone
+                        trade_result.rsi_divergence = stored_validation_result.rsi_divergence
+                        trade_result.candle_range_strength = stored_validation_result.candle_range_strength
+                        trade_result.pattern_strength_score = stored_validation_result.pattern_score
+                    else:
+                        # אם לא היה validation, נמלא ערכים ברירת מחדל או נחשב אותם
+                        if pattern_idx is not None and pattern_idx < len(df):
+                            # חישוב בסיסי בלי validator
+                            trade_result.volume_before = float(df["Volume"].iloc[pattern_idx - 1]) if pattern_idx > 0 else 0.0
+                            trade_result.volume_after = float(df["Volume"].iloc[pattern_idx])
+                            trade_result.is_trending = self.use_trend_filter and bool(self._trend_filter_long(df).iloc[pattern_idx])
+                            trade_result.pattern_strength_score = 0.0
+                    
+                    trades.append(trade_result)
                     in_trade = False
+                    stored_validation_result = None  # איפוס לריפוב הבא
+                    pattern_idx = None
+
+        elapsed_time = time.time() - start_time
+        
+        # סיכום תוצאות
+        logger.info(f"Backtest complete: {symbol}, pattern={pattern_name}")
+        logger.info(f"  Total signals: {num_signals}")
+        if self.use_pattern_validator:
+            logger.info(f"  Validation checks: {validation_checks}")
+            logger.info(f"  Passed validation: {validation_passed} ({validation_passed/max(validation_checks,1)*100:.1f}%)")
+            logger.info(f"  Failed (low score): {validation_failed_score} ({validation_failed_score/max(validation_checks,1)*100:.1f}%)")
+            logger.info(f"  Failed (filters): {validation_failed_filters} ({validation_failed_filters/max(validation_checks,1)*100:.1f}%)")
+            
+            # ניתוח מפורט של פילטרים נכשלים (אם יש הרבה נכשלים)
+            if validation_failed_filters > 0:
+                # סדר לפי הכי הרבה נכשלים
+                sorted_failures = sorted(filter_failures.items(), key=lambda x: x[1], reverse=True)
+                
+                if validation_passed == 0:
+                    logger.warning(f"  ⚠️  All {validation_failed_filters} patterns failed filters - filters may be too strict!")
+                    logger.warning(f"     Top failed filters (out of {validation_failed_filters} total failures):")
+                    
+                    # הצג את כל הפילטרים שנכשלו, גם אם יש מעט
+                    if sorted_failures:
+                        for filter_name, count in sorted_failures:
+                            percentage = (count / validation_failed_filters) * 100
+                            logger.warning(f"       - {filter_name}: {count}/{validation_failed_filters} ({percentage:.1f}%)")
+                    else:
+                        logger.warning(f"       ⚠️  No specific filter failures recorded - check validation logic!")
+                    
+                    logger.warning(f"     💡 Suggestions:")
+                    logger.warning(f"        - Lower min_pattern_score (currently: {self.min_pattern_score})")
+                    if sorted_failures:
+                        top_failed = [f[0] for f in sorted_failures[:3]]
+                        logger.warning(f"        - Disable strict filters: {', '.join(top_failed)}")
+                    logger.warning(f"        - Check if trading hours are correct (current: {self.validator.trading_start_hour}:00-{self.validator.trading_end_hour}:00)")
+                    logger.warning(f"        - Consider making filters less strict (currently ALL must pass)")
+                elif validation_failed_filters > validation_passed * 2:
+                    logger.info(f"  📊 Filter failure analysis (failed: {validation_failed_filters}, passed: {validation_passed}):")
+                    for filter_name, count in sorted_failures[:5]:
+                        percentage = (count / validation_failed_filters) * 100
+                        logger.info(f"       - {filter_name}: {count} failures ({percentage:.1f}%)")
+        logger.info(f"  Trades executed: {len(trades)}")
+        logger.info(f"  Elapsed time: {elapsed_time:.2f} seconds")
+        
+        if self.validator:
+            # איפוס cache אחרי כל backtest
+            self.validator.reset_cache()
 
         return BacktestStats(symbol=symbol, pattern=pattern_name, trades=trades)
 
@@ -336,6 +582,13 @@ def export_trades_to_csv(all_stats: List[BacktestStats], filename: str = "trades
                     "exit_price": t.exit_price,
                     "r_multiple": t.r_multiple,
                     "bars_in_trade": t.bars_in_trade,
+                    "volume_before": t.volume_before,
+                    "volume_after": t.volume_after,
+                    "is_trending": t.is_trending,
+                    "is_support_zone": t.is_support_zone,
+                    "rsi_divergence": t.rsi_divergence,
+                    "candle_range_strength": t.candle_range_strength,
+                    "pattern_strength_score": t.pattern_strength_score,
                 }
             )
     if not rows:
@@ -369,6 +622,13 @@ def export_to_excel(
                     "exit_price": t.exit_price,
                     "r_multiple": t.r_multiple,
                     "bars_in_trade": t.bars_in_trade,
+                    "volume_before": t.volume_before,
+                    "volume_after": t.volume_after,
+                    "is_trending": t.is_trending,
+                    "is_support_zone": t.is_support_zone,
+                    "rsi_divergence": t.rsi_divergence,
+                    "candle_range_strength": t.candle_range_strength,
+                    "pattern_strength_score": t.pattern_strength_score,
                 }
             )
 
